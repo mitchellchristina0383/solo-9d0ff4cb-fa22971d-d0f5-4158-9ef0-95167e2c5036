@@ -50,6 +50,8 @@
   .kv b { color:var(--mut); font-weight:600; }
   .uncertain-note { border-left:3px solid var(--warn); padding:8px 12px; background:rgba(241,185,68,.08);
                     border-radius:0 8px 8px 0; font-size:12.5px; }
+  .lookup { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+  .lookup input { min-width:260px; flex:0 1 360px; }
 </style>
 </head>
 <body>
@@ -78,14 +80,21 @@
   </section>
 
   <section class="card">
-    <h2>代理侧写入记录（含排空视角：非现役节点上未回执的写入）</h2>
+    <h2>代理侧写入记录（含排空视角：非现役节点上未确认回执的写入）</h2>
     <div style="overflow:auto"><table id="writes">
       <thead><tr><th>写入 ID</th><th>送达节点</th><th>状态</th><th>说明</th><th>时间</th><th></th></tr></thead>
       <tbody></tbody>
     </table></div>
+    <div class="lookup">
+      <input type="text" id="lookupId" placeholder="按原写入 ID 核实（完整 ID，可从后端记录复制）">
+      <button onclick="lookupById()">按 ID 向原节点核实并更新结论</button>
+    </div>
     <p class="uncertain-note" style="margin-top:12px">
-      ⚠️ <b>TIMEOUT_UNCERTAIN</b>：写入已在后端落库但回执超时，结果不确定。
-      系统<b>不会</b>自动向另一节点补投；可点"向原节点查询"核实（切流后仍查原送达节点）。
+      ⚠️ <b>TIMEOUT_UNCERTAIN / DISCONNECT_UNCERTAIN</b>：请求已发出但回执未归——
+      读超时，或回执前连接中断（如节点退出），写入<b>可能已在原节点落库</b>，结果不确定。
+      系统<b>不会</b>自动向另一节点补投；原节点同卷重启后可凭持久记录确认，
+      点"向原节点查询"或在上方输入原写入 ID 即可核实并就地更正（切流/连续切流后仍只查原送达节点）。
+      原节点暂不可达时保持待核，结论不变。
     </p>
   </section>
 
@@ -119,7 +128,9 @@ function fmt(ts){ return ts ? new Date(ts*1000).toLocaleTimeString('zh-CN',{hour
 function esc(s){ return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function statusBadge(s){
   const map = {ACKED:['b-ok','已回执 ACKED'], PENDING:['b-warn','待回执 PENDING'],
-    TIMEOUT_UNCERTAIN:['b-bad','结果不确定 TIMEOUT'], FAILED:['b-bad','失败 FAILED']};
+    TIMEOUT_UNCERTAIN:['b-bad','读超时不确定 TIMEOUT'],
+    DISCONNECT_UNCERTAIN:['b-bad','断线不确定 DISCONNECT'],
+    FAILED:['b-bad','未送达 FAILED']};
   const [cls,label] = map[s] || ['b-mut',s];
   return `<span class="badge ${cls}">${label}</span>`;
 }
@@ -141,6 +152,14 @@ async function setFault(name, on){
   await api(`/api/nodes/${name}/fault`, {method:'POST', body:JSON.stringify({on})});
   toast(`节点 ${name} 健康故障注入：${on?'开启':'解除'}`); await refresh();
 }
+async function crashNode(name){
+  if(!confirm(`让节点 ${name} 立即崩溃退出？（compose 会自动同卷重启；在途写入保持归属待核）`)) return;
+  try{
+    const r = await api(`/api/nodes/${name}/crash`, {method:'POST', body:JSON.stringify({delay:0})});
+    toast(`节点 ${name} 已触发崩溃（${r.delay}s），等待同卷重启…`);
+  }catch(e){ toast('崩溃指令失败：'+e.message, false); }
+  await refresh();
+}
 async function loadRecords(name){
   try{ $('#rec'+name).textContent = '加载中…';
     const r = await api(`/api/nodes/${name}/records`);
@@ -152,6 +171,24 @@ async function refreshOne(id){
     toast(r.note ? r.note : `已向原节点 ${r.write.target_node} 查询：${r.write.status}`);
     await refresh();
   }catch(e){ toast('查询失败：'+e.message, false); }
+}
+async function lookupById(){
+  const id = $('#lookupId').value.trim();
+  if(!id){ toast('请输入原写入 ID', false); return; }
+  try{
+    const r = await api(`/api/writes/${encodeURIComponent(id)}/refresh`);
+    const bv = r.backend_view || {};
+    if(r.refreshed){
+      toast(`原节点 ${r.write.target_node} 已凭持久记录确认：${r.write.status}`
+        + (bv.recovered ? '（重启恢复确认）' : ''));
+    }else{
+      toast(r.note || `暂未能确认，保持 ${r.write.status} 待核`);
+    }
+    await refresh();
+  }catch(e){
+    if(String(e.message).includes('unknown write')) toast('代理库中无此写入 ID：'+id, false);
+    else toast('核实失败：'+e.message, false);
+  }
 }
 
 $('#send').onclick = async () => {
@@ -165,8 +202,8 @@ $('#send').onclick = async () => {
     toast(`写入 ${r.id} 已由节点 ${r.node} 回执（耗时 ${((Date.now()-t0)/1000).toFixed(1)}s）`);
   }catch(e){
     const d = e.data || {};
-    if(d.uncertain) toast(`⚠️ 回执超时，结果不确定（${((Date.now()-t0)/1000).toFixed(1)}s），未补投`, false);
-    else toast('写入失败：'+e.message, false);
+    if(d.uncertain) toast(`⚠️ ${d.status||'UNCERTAIN'}：结果不确定（${((Date.now()-t0)/1000).toFixed(1)}s），未补投，可向原节点核实`, false);
+    else toast('写入失败（未送达）：'+e.message, false);
   }finally{ btn.disabled=false; btn.textContent='投递写入'; await refresh(); }
 };
 
@@ -189,13 +226,15 @@ async function refresh(){
       <div class="kv">
         <b>在途(未回执)</b><span>${d.inflight_now??0} 个 ${(d.inflight_ids||[]).length?('<code>'+d.inflight_ids.map(esc).join(', ')+'</code>'):''}</span>
         <b>写入总数</b><span>${d.total??0}</span>
-        <b>已回执 / 待回执 / 不确定 / 失败</b>
-        <span>${d.acked??0} / ${d.pending??0} / ${d.timeout_uncertain??0} / ${d.failed??0}</span>
+        <b>已回执 / 待回执 / 超时不确定 / 断线不确定 / 失败</b>
+        <span>${d.acked??0} / ${d.pending??0} / ${d.timeout_uncertain??0} / ${d.disconnect_uncertain??0} / ${d.failed??0}</span>
+        <b>待核（未确认回执）</b><span>${d.unresolved??0} 个${d.draining?' · 该旧节点排空中':''}</span>
       </div>
       <div class="row">
         <button class="primary" ${isActive?'disabled':''} onclick="switchTo('${esc(name)}')">切换流量到 ${esc(name)}</button>
         <button class="danger" onclick="setFault('${esc(name)}', true)">注入健康故障</button>
         <button onclick="setFault('${esc(name)}', false)">解除故障</button>
+        <button class="danger" onclick="crashNode('${esc(name)}')">模拟节点崩溃</button>
       </div>
     </div>`;
   }).join('');

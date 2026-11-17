@@ -16,8 +16,12 @@ DB_PATH = os.environ.get("PROXY_DB", "/data/proxy.db")
 # 写入状态机
 PENDING = "PENDING"        # 已送达/投递中，尚未拿到回执
 ACKED = "ACKED"            # 已拿到原节点成功回执
-TIMEOUT_UNCERTAIN = "TIMEOUT_UNCERTAIN"  # 写入已落库但回执超时，结果不确定
-FAILED = "FAILED"          # 节点明确拒绝（连接前失败/5xx），未送达
+TIMEOUT_UNCERTAIN = "TIMEOUT_UNCERTAIN"      # 读超时，已发请求、回执未归，结果不确定
+DISCONNECT_UNCERTAIN = "DISCONNECT_UNCERTAIN"  # 连接中断/重置等，请求可能已送达落库，结果不确定
+FAILED = "FAILED"          # 确认连接未建立或节点明确拒绝，写入未送达
+
+# 结果不确定类状态：禁止补投，只能向原节点核实。
+UNCERTAIN_STATUSES = (TIMEOUT_UNCERTAIN, DISCONNECT_UNCERTAIN)
 
 # 单连接 + 单写锁，SQLite 写入串行化，避免 lock 竞争。
 _conn: aiosqlite.Connection | None = None
@@ -180,6 +184,17 @@ async def get_write(write_id: str) -> dict[str, Any] | None:
 
 async def list_writes() -> list[dict[str, Any]]:
     cur = await _conn.execute("SELECT * FROM writes ORDER BY created_at DESC LIMIT 200")
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def list_unresolved() -> list[dict[str, Any]]:
+    """尚未拿到确定回执的写入（PENDING 与两类不确定），重启后用于待核提示。"""
+    placeholders = ",".join("?" for _ in (PENDING, *UNCERTAIN_STATUSES))
+    cur = await _conn.execute(
+        f"SELECT * FROM writes WHERE status IN ({placeholders}) ORDER BY created_at",
+        (PENDING, *UNCERTAIN_STATUSES),
+    )
     rows = await cur.fetchall()
     return [dict(r) for r in rows]
 

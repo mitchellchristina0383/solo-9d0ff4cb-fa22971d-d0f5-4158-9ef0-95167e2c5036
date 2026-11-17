@@ -6,8 +6,13 @@
   2. 切流只改 route 表，对已经发往旧节点、尚未回执的在途请求不做任何取消动作；
      回执仍从旧节点读取（也可事后用 /api/writes/{id}/refresh 向原节点查询）。
   3. 切流前先探测目标节点 /healthz，探测失败则保留旧路由并返回 409。
-  4. 读超时（写入大概率已在后端落库，只是回执没回来）标记为 TIMEOUT_UNCERTAIN，
-     返回 504 并在页面提示"结果不确定"，代理不做任何自动补投/重试。
+  4. 回执恢复链按"连接是否建立过"区分失败性质：
+       - 确认未建立连接（ConnectError/ConnectTimeout/PoolTimeout）→ FAILED，
+         写入确定未送达，不补投；
+       - 请求已发出后的读超时 → TIMEOUT_UNCERTAIN；
+       - 请求已发出后的连接中断/重置/协议错误（如节点在回执前退出）→
+         DISCONNECT_UNCERTAIN；两类不确定都只保留"结果不确定"，不自动补投，
+         待原节点恢复后凭其持久记录核实更正。
 """
 from __future__ import annotations
 
@@ -53,7 +58,12 @@ async def lifespan(app: FastAPI):
         # 显式关闭 httpx 默认的连接重试，保证"一次投递"语义。
         limits=httpx.Limits(max_connections=100),
     )
-    await db.add_event("BOOT", f"proxy started, active={await db.get_active()}")
+    unresolved = await db.list_unresolved()
+    await db.add_event(
+        "BOOT",
+        f"proxy started, active={await db.get_active()}, "
+        f"{len(unresolved)} write(s) still awaiting confirmation from original node",
+    )
     try:
         yield
     finally:
@@ -173,15 +183,15 @@ async def proxy_write(request: Request) -> JSONResponse:
         resp = await client.post(
             f"{base_url}/writes", params={"delay": delay}, json=body
         )
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
-            httpx.WriteTimeout) as exc:
-        # 连接层面失败：请求没有被后端受理，标记 FAILED，不向任何节点补投。
-        detail = f"connect to {active} failed: {type(exc).__name__}: {exc}"
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+        # 确认连接未建立：请求没有被后端受理，标记 FAILED，不向任何节点补投。
+        detail = f"connect to {active} failed before delivery: {type(exc).__name__}: {exc}"
         await db.update_write_status(write_id, db.FAILED, detail)
         await db.add_event("WRITE_FAILED", f"{write_id} -> {active}: {detail}")
         return JSONResponse(status_code=502,
                             content={"id": write_id, "node": active,
-                                     "status": db.FAILED, "detail": detail})
+                                     "status": db.FAILED, "uncertain": False,
+                                     "detail": detail})
     except httpx.ReadTimeout:
         # 读超时：请求已送达，后端可能已落库，回执未归。结果不确定，禁止补投。
         detail = (f"read timeout after {READ_TIMEOUT}s waiting ack from {active}; "
@@ -194,12 +204,34 @@ async def proxy_write(request: Request) -> JSONResponse:
                             content={"id": write_id, "node": active,
                                      "status": db.TIMEOUT_UNCERTAIN,
                                      "uncertain": True, "detail": detail})
-    except httpx.HTTPError as exc:
-        detail = f"unexpected transport error against {active}: {exc}"
-        await db.update_write_status(write_id, db.FAILED, detail)
+    except (httpx.WriteTimeout, httpx.ReadError, httpx.NetworkError,
+            httpx.RemoteProtocolError, httpx.LocalProtocolError) as exc:
+        # 请求已经（可能已经）送达后连接中断：节点也许已经落库，只是回执前连接断了
+        # （典型：旧节点在回执前退出）。保留结果不确定，绝不按 FAILED 处理、绝不补投；
+        # 待原节点同卷重启后凭其持久记录核实。
+        detail = (f"connection to {active} broken after request was sent: "
+                  f"{type(exc).__name__}: {exc}; delivery not confirmed, "
+                  "write may already be persisted on the original node, result UNCERTAIN; "
+                  "no automatic re-delivery to another node")
+        await db.update_write_status(write_id, db.DISCONNECT_UNCERTAIN, detail)
+        await db.add_event("WRITE_DISCONNECT_UNCERTAIN",
+                           f"{write_id} -> {active}: {detail}")
         return JSONResponse(status_code=502,
                             content={"id": write_id, "node": active,
-                                     "status": db.FAILED, "detail": detail})
+                                     "status": db.DISCONNECT_UNCERTAIN,
+                                     "uncertain": True, "detail": detail})
+    except httpx.HTTPError as exc:
+        # 其它未细分的传输异常：无法证明未送达，保守按不确定处理，同样不补投。
+        detail = (f"unclassified transport error against {active} after dispatch: "
+                  f"{type(exc).__name__}: {exc}; result UNCERTAIN; "
+                  "no automatic re-delivery to another node")
+        await db.update_write_status(write_id, db.DISCONNECT_UNCERTAIN, detail)
+        await db.add_event("WRITE_DISCONNECT_UNCERTAIN",
+                           f"{write_id} -> {active}: {detail}")
+        return JSONResponse(status_code=502,
+                            content={"id": write_id, "node": active,
+                                     "status": db.DISCONNECT_UNCERTAIN,
+                                     "uncertain": True, "detail": detail})
     finally:
         await _untrack(active, write_id)
 
@@ -230,7 +262,12 @@ async def proxy_write(request: Request) -> JSONResponse:
 
 @app.get("/api/writes/{write_id}/refresh")
 async def refresh_write(write_id: str) -> JSONResponse:
-    """向"原送达节点"查询该写入的最新回执状态——切流后仍然找旧节点。"""
+    """向"原送达节点"查询该写入的最新回执状态——切流后仍然找原节点。
+
+    - 原节点暂不可达：保持原状态（待核），不覆盖结论、不向其他节点补投；
+    - 原节点仍在慢回执（backend 报 pending）：不提前确认，保持原状态；
+    - 原节点凭持久记录确认 acked（含重启恢复）：就地更正为 ACKED，归属不变。
+    """
     row = await db.get_write(write_id)
     if row is None:
         return JSONResponse(status_code=404,
@@ -245,30 +282,43 @@ async def refresh_write(write_id: str) -> JSONResponse:
                                   write=CONNECT_TIMEOUT, pool=CONNECT_TIMEOUT),
         )
     except httpx.RequestError as exc:
-        detail = f"refresh query to original node {node} failed: {type(exc).__name__}"
-        await db.update_write_status(write_id, row["status"],
-                                     f"{row['status_detail']} | {detail}")
-        refreshed = await db.get_write(write_id)
+        # 节点暂不可达：结论保持不变，等待稍后再核，绝不补投别的节点。
+        note = (f"original node {node} temporarily unreachable "
+                f"({type(exc).__name__}); keep status {row['status']} pending "
+                "verification, no re-delivery")
+        await db.add_event("WRITE_REFRESH_PENDING",
+                           f"{write_id}: {note}")
         return JSONResponse(status_code=200,
-                            content={"refreshed": False, "write": refreshed,
-                                     "note": detail})
+                            content={"refreshed": False, "reachable": False,
+                                     "write": row, "note": note})
 
     if resp.status_code == 404:
         note = (f"original node {node} has no row yet; keep status {row['status']} "
                 "(do not re-deliver)")
-        return JSONResponse(content={"refreshed": False, "write": row, "note": note})
+        return JSONResponse(content={"refreshed": False, "reachable": True,
+                                     "write": row, "note": note})
 
     data = resp.json()
-    if data.get("status") == "acked" and row["status"] != db.ACKED:
-        await db.update_write_status(
-            write_id, db.ACKED,
-            f"acked confirmed later by original node {node}", acked=True
-        )
-        await db.add_event("WRITE_RESOLVED",
-                           f"{write_id} confirmed acked by original node {node}")
-    refreshed = await db.get_write(write_id)
-    return JSONResponse(content={"refreshed": True, "write": refreshed,
-                                 "backend_view": data})
+    if data.get("status") == "acked":
+        if row["status"] != db.ACKED:
+            if data.get("recovered"):
+                detail = (f"acked confirmed after restart from the persisted record "
+                          f"on original node {node} (recovered_at={data.get('recovered_at')})")
+                event_kind = "WRITE_RECOVERED"
+            else:
+                detail = f"acked confirmed later by original node {node}"
+                event_kind = "WRITE_RESOLVED"
+            await db.update_write_status(write_id, db.ACKED, detail, acked=True)
+            await db.add_event(event_kind, f"{write_id}: {detail}")
+        refreshed = await db.get_write(write_id)
+        return JSONResponse(content={"refreshed": True, "reachable": True,
+                                     "write": refreshed, "backend_view": data})
+
+    # 后端仍报告 pending：慢回执还在运行，查询不得提前确认，状态原样保留。
+    note = (f"original node {node} still processing the slow ack; "
+            f"keep status {row['status']} (queries never confirm early)")
+    return JSONResponse(content={"refreshed": False, "reachable": True,
+                                 "write": row, "backend_view": data, "note": note})
 
 
 # ---------------------------------------------------------------- 状态/排空
@@ -285,22 +335,24 @@ async def status() -> JSONResponse:
 
     # 排空视角：已切走的旧节点上仍未拿到回执的写入。
     per_node: dict[str, dict[str, Any]] = {}
+    empty_slot = lambda: {"total": 0, "pending": 0, "acked": 0,
+                          "timeout_uncertain": 0, "disconnect_uncertain": 0,
+                          "failed": 0}
     for w in writes:
-        slot = per_node.setdefault(
-            w["target_node"], {"total": 0, "pending": 0, "acked": 0,
-                               "timeout_uncertain": 0, "failed": 0}
-        )
+        slot = per_node.setdefault(w["target_node"], empty_slot())
         slot["total"] += 1
         slot[w["status"].lower()] = slot.get(w["status"].lower(), 0) + 1
     for name in health:
-        per_node.setdefault(name, {"total": 0, "pending": 0, "acked": 0,
-                                   "timeout_uncertain": 0, "failed": 0})
+        per_node.setdefault(name, empty_slot())
     for name, slot in per_node.items():
         slot["inflight_now"] = inflight_counts.get(name, 0)
         slot["inflight_ids"] = inflight_ids.get(name, [])
         slot["is_active"] = name == active
+        # 未确认（PENDING 或任一不确定状态）的旧节点都处于排空待核。
+        slot["unresolved"] = (slot["pending"] + slot["timeout_uncertain"]
+                              + slot["disconnect_uncertain"])
         slot["draining"] = name != active and (
-            slot["inflight_now"] > 0 or slot["pending"] > 0
+            slot["inflight_now"] > 0 or slot["unresolved"] > 0
         )
 
     return JSONResponse(content={
@@ -348,6 +400,35 @@ async def node_fault(name: str, request: Request) -> JSONResponse:
                             content={"error": f"node {name} unreachable: {exc}"})
     await db.add_event("FAULT_INJECTION",
                        f"node {name} fault on={bool(body.get('on', True))}")
+    return JSONResponse(content=resp.json())
+
+
+@app.post("/api/nodes/{name}/crash")
+async def node_crash(name: str, request: Request) -> JSONResponse:
+    """让某后端立即（或延迟）崩溃退出（透传后端控制接口），演练回执前节点退出。
+
+    compose 中后端配 restart 策略后会同卷自动重启，代理侧在途/不确定写入
+    可随后用 /api/writes/{id}/refresh 凭原节点持久记录核实。
+    """
+    base_url = await db.node_url(name)
+    if base_url is None:
+        return JSONResponse(status_code=404, content={"error": f"unknown node {name}"})
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        resp = await app.state.http.post(
+            f"{base_url}/control/crash",
+            json={"delay": float(body.get("delay", 0) or 0)},
+            timeout=httpx.Timeout(PROBE_TIMEOUT),
+        )
+    except httpx.RequestError as exc:
+        return JSONResponse(status_code=502,
+                            content={"error": f"node {name} unreachable: {exc}"})
+    await db.add_event("NODE_CRASH",
+                       f"node {name} instructed to crash (delay={body.get('delay', 0)}s); "
+                       "in-flight writes stay bound to this node, awaiting verification")
     return JSONResponse(content=resp.json())
 
 

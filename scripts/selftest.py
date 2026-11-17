@@ -9,7 +9,13 @@
   4. 连续两次切流都不打断各自的在途写入（再次切流安全）；
   5. 回执超时：返回 504 + TIMEOUT_UNCERTAIN，不自动补投；
      事后向"原送达节点"查询可确认其实已落库并回执；
-  6. 全量核对：两侧后端写入 ID 集合不相交，每条写入恰好出现一次。
+  6. 全量核对：两侧后端写入 ID 集合不相交，每条写入恰好一次；
+  7. 回执前节点崩溃：代理记 DISCONNECT_UNCERTAIN（不记 FAILED、不补投），
+     原节点同卷重启后凭持久记录恢复确认，refresh 后转 ACKED；
+  8. 确认未建立连接（节点未运行）的写入仍为 FAILED；
+  9. 仍在运行的慢回执不会被查询提前确认，自然结束后才 ACKED；
+ 10. 代理自身重启：路由与写入归属不变，待核写入仍绑定原节点；
+ 11. 原节点暂不可达时 refresh 保持待核，结论不变。
 
 用法:
   python3 -I scripts/selftest.py [--python /path/to/venv/python]
@@ -32,22 +38,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PASS, FAIL = 0, 0
-RESULTS: list[tuple[bool, str]] = []
 
 
 def check(cond: bool, name: str, detail: str = "") -> None:
     global PASS, FAIL
     if cond:
         PASS += 1
-        RESULTS.append((True, f"PASS  {name}" + (f"  ({detail})" if detail else "")))
         print(f"  \033[32mPASS\033[0m  {name} {detail}")
     else:
         FAIL += 1
-        RESULTS.append((False, f"FAIL  {name}  {detail}"))
         print(f"  \033[31mFAIL\033[0m  {name} {detail}")
 
 
 def http(method: str, url: str, body: dict | None = None, timeout: float = 30):
+    """返回 (status, json)。连接层失败返回 (-1, {"error": ...})。"""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method,
                                  headers={"Content-Type": "application/json"})
@@ -56,6 +60,8 @@ def http(method: str, url: str, body: dict | None = None, timeout: float = 30):
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode())
+    except (urllib.error.URLError, ConnectionError, OSError) as exc:
+        return -1, {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def wait_ready(url: str, timeout: float = 20) -> bool:
@@ -70,16 +76,31 @@ def wait_ready(url: str, timeout: float = 20) -> bool:
     return False
 
 
+def wait_dead(url: str, timeout: float = 10) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=1)
+        except Exception:
+            return True
+        time.sleep(0.2)
+    return False
+
+
 def wait_status(proxy: str, write_id: str, expect: str, timeout: float = 15) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
         _, s = http("GET", f"{proxy}/api/status")
         for w in s["writes"]:
-            if w["id"] == write_id:
-                if w["status"] == expect:
-                    return w
+            if w["id"] == write_id and w["status"] == expect:
+                return w
         time.sleep(0.15)
     raise AssertionError(f"write {write_id} never reached status {expect}")
+
+
+def get_write_row(proxy: str, write_id: str) -> dict:
+    _, s = http("GET", f"{proxy}/api/status")
+    return next(w for w in s["writes"] if w["id"] == write_id)
 
 
 class SlowPost(threading.Thread):
@@ -104,9 +125,10 @@ def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="cutover-selftest-"))
     logs = work / "logs"
     logs.mkdir()
-    procs: list[subprocess.Popen] = []
+    procs: dict[str, subprocess.Popen] = {}
     ports = {"proxy": 18000, "A": 18001, "B": 18002}
     proxy = f"http://127.0.0.1:{ports['proxy']}"
+    db_paths = {"A": work / "a.db", "B": work / "b.db"}
 
     def spawn(kind: str, app_dir: Path, env: dict, port: int) -> None:
         log = open(logs / f"{kind}.log", "wb")
@@ -115,25 +137,40 @@ def main() -> int:
              "--host", "127.0.0.1", "--port", str(port), "--app-dir", str(app_dir)],
             env={**os.environ, **env}, stdout=log, stderr=subprocess.STDOUT,
         )
-        procs.append(p)
+        procs[kind] = p
+
+    def stop(kind: str) -> None:
+        p = procs.pop(kind, None)
+        if p is None:
+            return
+        p.terminate()
+        try:
+            p.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait(timeout=5)
+
+    def spawn_backend(node: str) -> None:
+        spawn(f"backend-{node}", ROOT / "backend",
+              {"NODE_NAME": node, "BACKEND_DB": str(db_paths[node])}, ports[node])
+        assert wait_ready(f"http://127.0.0.1:{ports[node]}/healthz")
 
     try:
         print("== 启动两个后端 + 代理（读回执超时 2s，便于演练超时场景） ==")
-        spawn("backend-a", ROOT / "backend",
-              {"NODE_NAME": "A", "BACKEND_DB": str(work / "a.db")}, ports["A"])
-        spawn("backend-b", ROOT / "backend",
-              {"NODE_NAME": "B", "BACKEND_DB": str(work / "b.db")}, ports["B"])
-        ok_a = wait_ready(f"http://127.0.0.1:{ports['A']}/healthz")
-        ok_b = wait_ready(f"http://127.0.0.1:{ports['B']}/healthz")
-        check(ok_a and ok_b, "两个后端启动并健康", f"A={ok_a} B={ok_b}")
+        spawn_backend("A")
+        spawn_backend("B")
+        check(wait_ready(f"http://127.0.0.1:{ports['A']}/healthz")
+              and wait_ready(f"http://127.0.0.1:{ports['B']}/healthz"),
+              "两个后端启动并健康")
 
-        spawn("proxy", ROOT / "proxy", {
+        proxy_env = {
             "NODE_A_NAME": "A", "NODE_B_NAME": "B",
             "BACKEND_A_URL": f"http://127.0.0.1:{ports['A']}",
             "BACKEND_B_URL": f"http://127.0.0.1:{ports['B']}",
             "PROXY_DB": str(work / "proxy.db"),
             "WRITER_READ_TIMEOUT": "2", "CONNECT_TIMEOUT": "2", "PROBE_TIMEOUT": "2",
-        }, ports["proxy"])
+        }
+        spawn("proxy", ROOT / "proxy", proxy_env, ports["proxy"])
         check(wait_ready(proxy + "/"), "代理启动并提供控制台页面")
 
         _, st = http("GET", f"{proxy}/api/status")
@@ -151,7 +188,6 @@ def main() -> int:
         print("\n== 场景 2：慢回执在途切流 A -> B，不中断、不重复 ==")
         slow1 = SlowPost(proxy, 1.2, "slow-during-cutover-1")
         slow1.start()
-        # 等代理把 PENDING 行落库（请求已送达 A、回执未归）
         deadline = time.time() + 5
         pending_id = None
         while time.time() < deadline:
@@ -176,7 +212,8 @@ def main() -> int:
         check(not slow1.is_alive() and slow1.result and slow1.result[0] == 201,
               "在途写入未被切流打断，仍正常拿到回执")
         check(slow1.write_id == pending_id and slow1.result[1]["node"] == "A",
-              "回执仍来自原送达节点 A", f"node={slow1.result[1].get('node') if slow1.result else '?'}")
+              "回执仍来自原送达节点 A",
+              f"node={slow1.result[1].get('node') if slow1.result else '?'}")
         row = wait_status(proxy, pending_id, "ACKED")
         check(row["target_node"] == "A", "代理记录中该写入始终绑定 A")
 
@@ -227,8 +264,7 @@ def main() -> int:
               f"读超时返回 504 + TIMEOUT_UNCERTAIN（{elapsed:.1f}s 触发）")
         timeout_id = tout["id"]
         timeout_node = tout["node"]
-        _, s3 = http("GET", f"{proxy}/api/status")
-        row = next(w for w in s3["writes"] if w["id"] == timeout_id)
+        row = get_write_row(proxy, timeout_id)
         check(row["status"] == "TIMEOUT_UNCERTAIN", "超时状态已落库，页面可见结果不确定")
         _, rec_other = http("GET", f"{proxy}/api/nodes/"
                             f"{'B' if timeout_node == 'A' else 'A'}/records")
@@ -253,25 +289,171 @@ def main() -> int:
               f"代理侧 {len(proxy_ids)} 条写入与后端记录一一对应",
               f"A={len(ids_a)} B={len(ids_b)}")
 
-        # 直接打开后端 SQLite 核对持久化（后端各自保存写入的硬性要求）
-        for node, db_path in (("A", work / "a.db"), ("B", work / "b.db")):
+        print("\n== 场景 7：回执前节点崩溃 -> DISCONNECT_UNCERTAIN，同卷重启后恢复确认 ==")
+        # 先确保现役是 A，向 A 投一笔 8s 慢写入。
+        if http("GET", f"{proxy}/api/status")[1]["active"] != "A":
+            code, _ = http("POST", f"{proxy}/api/switch", {"target": "A"})
+            assert code == 200
+        crash_post = SlowPost(proxy, 8, "crash-before-ack")
+        crash_post.start()
+        crash_id = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            _, s = http("GET", f"{proxy}/api/status")
+            for row in s["writes"]:
+                if row["payload"] == "crash-before-ack" and row["status"] == "PENDING":
+                    crash_id = row["id"]
+            if crash_id:
+                break
+            time.sleep(0.1)
+        check(bool(crash_id), "慢写入已送达 A 并落库（PENDING）")
+        # 立刻让 A 崩溃：写入已落库、回执前节点退出。
+        code, cr = http("POST", f"{proxy}/api/nodes/A/crash", {"delay": 0})
+        # 代理透传 JSON（状态码归一为 200，crashing 标志保留）；
+        # 若响应未及送出进程已退出，也可能得到 502/-1，均说明崩溃指令生效。
+        check((code == 200 and cr.get("crashing") is True) or code in (502, -1),
+              "崩溃指令已下发到节点 A", f"http={code} body={str(cr)[:80]}")
+        check(wait_dead(f"http://127.0.0.1:{ports['A']}/healthz"), "节点 A 已退出")
+        crash_post.join(timeout=15)
+        check(crash_post.result is not None, "崩溃后代理对客户端的写入请求已返回")
+        cstatus, cbody = crash_post.result
+        check(cstatus == 502 and cbody.get("uncertain") is True
+              and cbody.get("status") == "DISCONNECT_UNCERTAIN",
+              "回执前断线保留结果不确定（不记 FAILED）",
+              f"http={cstatus} status={cbody.get('status')}")
+        row = get_write_row(proxy, crash_id)
+        check(row["status"] == "DISCONNECT_UNCERTAIN" and row["target_node"] == "A",
+              "代理持久记录：DISCONNECT_UNCERTAIN 且归属仍为 A")
+        _, rec_b = http("GET", f"{proxy}/api/nodes/B/records")
+        check(not any(r["id"] == crash_id for r in rec_b["records"]),
+              "断线后未向 B 补投")
+
+        # 节点暂不可达时 refresh：保持待核，结论不变。
+        code, ref_dead = http("GET", f"{proxy}/api/writes/{crash_id}/refresh")
+        check(code == 200 and ref_dead.get("reachable") is False
+              and ref_dead["write"]["status"] == "DISCONNECT_UNCERTAIN",
+              "原节点不可达时 refresh 保持待核，不覆盖结论")
+
+        # 同卷重启 A：启动恢复应把崩溃遗留行就地确认。
+        spawn_backend("A")
+        con = sqlite3.connect(db_paths["A"])
+        rec = con.execute(
+            "SELECT acked_at, recovered_at FROM writes WHERE id = ?", (crash_id,)
+        ).fetchone()
+        con.close()
+        check(rec is not None and rec[0] is not None and rec[1] is not None,
+              "A 同卷重启后凭持久记录恢复确认该写入（acked_at/recovered_at 均写入）")
+        code, ref_rec = http("GET", f"{proxy}/api/writes/{crash_id}/refresh")
+        check(code == 200 and ref_rec["refreshed"] is True
+              and ref_rec["write"]["status"] == "ACKED"
+              and ref_rec["write"]["target_node"] == "A"
+              and ref_rec["backend_view"].get("recovered") is True,
+              "控制台按原写入 ID 核实后转 ACKED，归属不变（重启恢复确认）")
+        check(get_write_row(proxy, crash_id)["status"] == "ACKED",
+              "代理库结论已持久更正为 ACKED")
+
+        print("\n== 场景 8：确认未建立连接（节点未运行）仍为 FAILED ==")
+        # 切到 B 作为现役，然后停掉 B，使新写入在连接阶段失败。
+        code, _ = http("POST", f"{proxy}/api/switch", {"target": "B"})
+        check(code == 200, "切流到 B 成功")
+        stop("backend-B")
+        check(wait_dead(f"http://127.0.0.1:{ports['B']}/healthz"), "节点 B 已停止")
+        t0 = time.time()
+        code, fail_body = http("POST", f"{proxy}/api/writes?delay=0",
+                               {"payload": "connect-refused"}, timeout=15)
+        elapsed = time.time() - t0
+        check(code == 502 and fail_body.get("status") == "FAILED"
+              and fail_body.get("uncertain") is False,
+              f"连接未建立记 FAILED（{elapsed:.1f}s）", fail_body.get("detail", "")[:80])
+        fail_id = fail_body.get("id")
+        check(get_write_row(proxy, fail_id)["status"] == "FAILED", "FAILED 已持久化")
+        spawn_backend("B")  # 恢复 B 供后续场景
+
+        print("\n== 场景 9：仍在运行的慢回执不会被查询提前确认 ==")
+        code, _ = http("POST", f"{proxy}/api/switch", {"target": "A"})
+        assert code == 200
+        # 延迟 1.2s 短于代理读超时 2s：请求保持在途，不会先被超时改写。
+        live = SlowPost(proxy, 1.2, "live-slow-ack")
+        live.start()
+        live_id = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            _, s = http("GET", f"{proxy}/api/status")
+            for row in s["writes"]:
+                if row["payload"] == "live-slow-ack":
+                    live_id = row["id"]
+            if live_id:
+                break
+            time.sleep(0.1)
+        check(bool(live_id), "新的慢写入已进入 PENDING")
+        time.sleep(1.0)
+        code, early = http("GET", f"{proxy}/api/writes/{live_id}/refresh")
+        check(code == 200 and early.get("refreshed") is False
+              and early["write"]["status"] == "PENDING",
+              "慢回执仍在运行时查询不提前确认，保持 PENDING")
+        # 直接问后端，也应仍是 pending（未被恢复逻辑误伤）。
+        code, backend_view = http(
+            "GET", f"http://127.0.0.1:{ports['A']}/writes/{live_id}")
+        check(code == 200 and backend_view["status"] == "pending"
+              and backend_view.get("recovered") is False,
+              "后端视角同样仍是 pending（活的慢回执未被启动恢复标记）")
+        live.join(timeout=15)
+        row = wait_status(proxy, live_id, "ACKED")
+        check(row["status"] == "ACKED", "慢回执自然结束后才转 ACKED")
+
+        print("\n== 场景 10：代理自身重启，路由与写入归属不变 ==")
+        # 先制造一笔不确定写入（超时），记录其归属，再重启代理。
+        active_now = http("GET", f"{proxy}/api/status")[1]["active"]
+        code, uncert = http("POST", f"{proxy}/api/writes?delay=5",
+                            {"payload": "across-proxy-restart"}, timeout=15)
+        check(code == 504 and uncert["status"] == "TIMEOUT_UNCERTAIN",
+              "制造一笔待核写入用于代理重启验证")
+        uncert_id, uncert_node = uncert["id"], uncert["node"]
+        stop("proxy")
+        spawn("proxy", ROOT / "proxy", proxy_env, ports["proxy"])
+        check(wait_ready(proxy + "/"), "代理重启完成")
+        _, s3 = http("GET", f"{proxy}/api/status")
+        check(s3["active"] == active_now, "重启后现役路由保持不变",
+              f"active={s3['active']}")
+        row = next(w for w in s3["writes"] if w["id"] == uncert_id)
+        check(row["target_node"] == uncert_node
+              and row["status"] == "TIMEOUT_UNCERTAIN",
+              "待核写入重启后仍绑定原节点、状态不变")
+        boot_events = [e for e in s3["events"] if e["kind"] == "BOOT"]
+        check(any("awaiting confirmation" in e["message"] for e in boot_events),
+              "重启 BOOT 事件提示有待核写入")
+        time.sleep(4.5)
+        code, ref_after = http("GET", f"{proxy}/api/writes/{uncert_id}/refresh")
+        check(ref_after["write"]["status"] == "ACKED"
+              and ref_after["write"]["target_node"] == uncert_node,
+              "重启后仍可向原节点核实并更正，归属不变")
+
+        print("\n== 场景 11：最终持久化核对 ==")
+        for node, db_path in (("A", db_paths["A"]), ("B", db_paths["B"])):
             con = sqlite3.connect(db_path)
             n = con.execute("SELECT COUNT(*) FROM writes").fetchone()[0]
             con.close()
-            check(n == len(ids_a if node == "A" else ids_b),
+            _, rec = http("GET", f"{proxy}/api/nodes/{node}/records")
+            check(n == len(rec["records"]),
                   f"后端 {node} 的 SQLite 持久化写入数 = {n}")
+        _, rec_a = http("GET", f"{proxy}/api/nodes/A/records")
+        _, rec_b = http("GET", f"{proxy}/api/nodes/B/records")
+        ids_a, ids_b = {r["id"] for r in rec_a["records"]}, {r["id"] for r in rec_b["records"]}
+        check(ids_a.isdisjoint(ids_b), "最终 A/B 写入 ID 集合仍不相交")
+        # 崩溃那笔必须只在 A，且带恢复标记。
+        crash_rows = [r for r in rec_a["records"] if r["id"] == crash_id]
+        check(len(crash_rows) == 1 and crash_rows[0].get("recovered_at") is not None,
+              "崩溃写入仅存在于 A 且带 recovered_at 标记")
+        # 连接失败那笔两个后端都不该有。
+        check(fail_id not in ids_a and fail_id not in ids_b,
+              "FAILED（未送达）写入未出现在任何后端")
 
     finally:
         print("\n== 清理进程 ==")
-        for p in procs:
-            p.terminate()
-        for p in procs:
-            try:
-                p.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                p.kill()
+        for kind in list(procs):
+            stop(kind)
         if FAIL:
-            print(f"\n日志保留在: {logs}")
+            print(f"\n日志与临时数据保留在: {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
 

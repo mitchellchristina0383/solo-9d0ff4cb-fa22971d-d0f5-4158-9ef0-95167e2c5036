@@ -1,6 +1,7 @@
 services:
   backend-a:
     build: ./backend
+    restart: unless-stopped
     environment:
       NODE_NAME: "A"
       BACKEND_DB: /data/writes.db
@@ -14,6 +15,7 @@ services:
 
   backend-b:
     build: ./backend
+    restart: unless-stopped
     environment:
       NODE_NAME: "B"
       BACKEND_DB: /data/writes.db
