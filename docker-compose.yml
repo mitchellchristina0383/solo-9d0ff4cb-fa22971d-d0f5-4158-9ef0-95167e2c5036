@@ -1,0 +1,53 @@
+services:
+  backend-a:
+    build: ./backend
+    environment:
+      NODE_NAME: "A"
+      BACKEND_DB: /data/writes.db
+    volumes:
+      - backend-a-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend-b:
+    build: ./backend
+    environment:
+      NODE_NAME: "B"
+      BACKEND_DB: /data/writes.db
+    volumes:
+      - backend-b-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  proxy:
+    build: ./proxy
+    ports:
+      - "8080:8000"
+    environment:
+      NODE_A_NAME: "A"
+      NODE_B_NAME: "B"
+      BACKEND_A_URL: http://backend-a:8000
+      BACKEND_B_URL: http://backend-b:8000
+      PROXY_DB: /data/proxy.db
+      # 读回执超过该秒数即判定"结果不确定"，不补投；按需调小做超时演练。
+      WRITER_READ_TIMEOUT: "30"
+      CONNECT_TIMEOUT: "3"
+      PROBE_TIMEOUT: "2.5"
+    volumes:
+      - proxy-data:/data
+    depends_on:
+      backend-a:
+        condition: service_healthy
+      backend-b:
+        condition: service_healthy
+
+volumes:
+  backend-a-data:
+  backend-b-data:
+  proxy-data:

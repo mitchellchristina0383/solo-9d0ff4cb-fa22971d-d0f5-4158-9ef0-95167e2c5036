@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>写入切流控制台</title>
+<style>
+  :root { --bg:#0f1420; --card:#182032; --line:#27324a; --txt:#e6ebf5; --mut:#8a97ad;
+          --ok:#2ecc71; --warn:#f1b944; --bad:#ff5c5c; --info:#4aa3ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--txt); }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex;
+           align-items:center; gap:16px; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; }
+  main { padding:20px 24px; display:grid; gap:18px; max-width:1280px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .card h2 { font-size:15px; margin:0 0 12px; color:var(--mut); font-weight:600; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  @media (max-width:900px){ .grid2{grid-template-columns:1fr;} }
+  .node { display:grid; gap:10px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:600; }
+  .b-ok { background:rgba(46,204,113,.15); color:var(--ok); }
+  .b-bad { background:rgba(255,92,92,.15); color:var(--bad); }
+  .b-warn { background:rgba(241,185,68,.15); color:var(--warn); }
+  .b-info { background:rgba(74,163,255,.15); color:var(--info); }
+  .b-mut { background:rgba(138,151,173,.15); color:var(--mut); }
+  button { border:1px solid var(--line); background:#223050; color:var(--txt);
+           border-radius:7px; padding:7px 14px; cursor:pointer; font-size:13px; }
+  button:hover { border-color:var(--info); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.primary { background:var(--info); border-color:var(--info); color:#08111f; font-weight:700; }
+  button.danger { background:rgba(255,92,92,.15); border-color:var(--bad); color:var(--bad); }
+  input,textarea,select { background:#0d1322; border:1px solid var(--line); color:var(--txt);
+           border-radius:7px; padding:8px 10px; font-size:13px; font-family:inherit; }
+  input[type=number]{ width:110px; } input[type=text]{ flex:1; min-width:200px; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--mut); font-weight:600; }
+  code { color:var(--info); }
+  .muted { color:var(--mut); }
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; }
+  pre { white-space:pre-wrap; word-break:break-all; margin:0; max-height:260px; overflow:auto;
+        background:#0d1322; border:1px solid var(--line); border-radius:8px; padding:10px; font-size:12px; }
+  .toast { position:fixed; right:20px; bottom:20px; max-width:420px; display:grid; gap:8px; z-index:9; }
+  .toast div { background:#223050; border:1px solid var(--line); border-radius:8px; padding:10px 14px; }
+  .toast .err { border-color:var(--bad); } .toast .ok { border-color:var(--ok); }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:3px 14px; font-size:13px; }
+  .kv b { color:var(--mut); font-weight:600; }
+  .uncertain-note { border-left:3px solid var(--warn); padding:8px 12px; background:rgba(241,185,68,.08);
+                    border-radius:0 8px 8px 0; font-size:12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>写入切流控制台</h1>
+  <span>现役节点：<span id="active" class="badge b-info">-</span></span>
+  <span class="muted" id="clock"></span>
+  <span style="flex:1"></span>
+  <label class="muted"><input type="checkbox" id="autopoll" checked> 每 2 秒自动刷新</label>
+</header>
+
+<main>
+  <section class="card">
+    <h2>节点与切流（探测失败会保留旧路由；切流不打断在途写入，回执仍从原节点取）</h2>
+    <div class="grid2" id="nodes"></div>
+  </section>
+
+  <section class="card">
+    <h2>发起写入（可在写入尚未返回期间切流）</h2>
+    <div class="row">
+      <input type="text" id="payload" placeholder='写入内容，例如 {"order":42}，留空自动生成'>
+      <label class="muted">慢回执延迟(秒) <input type="number" id="delay" value="8" min="0" step="0.5"></label>
+      <button class="primary" id="send">投递写入</button>
+    </div>
+    <p class="muted" style="margin:10px 0 0">提示：延迟设 8~15 秒后点投递，在返回前立刻点另一节点的"切换流量"，即可演练在途切流。</p>
+  </section>
+
+  <section class="card">
+    <h2>代理侧写入记录（含排空视角：非现役节点上未回执的写入）</h2>
+    <div style="overflow:auto"><table id="writes">
+      <thead><tr><th>写入 ID</th><th>送达节点</th><th>状态</th><th>说明</th><th>时间</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <p class="uncertain-note" style="margin-top:12px">
+      ⚠️ <b>TIMEOUT_UNCERTAIN</b>：写入已在后端落库但回执超时，结果不确定。
+      系统<b>不会</b>自动向另一节点补投；可点"向原节点查询"核实（切流后仍查原送达节点）。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>各后端自己保存的写入记录</h2>
+    <div class="grid2">
+      <div><div class="row" style="margin-bottom:8px"><b id="recA-title">节点 A</b>
+        <button onclick="loadRecords('A')">拉取 A 的记录</button></div><pre id="recA" class="mono">（未加载）</pre></div>
+      <div><div class="row" style="margin-bottom:8px"><b id="recB-title">节点 B</b>
+        <button onclick="loadRecords('B')">拉取 B 的记录</button></div><pre id="recB" class="mono">（未加载）</pre></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>事件日志（切流 / 探测拦截 / 回执 / 超时）</h2>
+    <table><thead><tr><th>时间</th><th>类型</th><th>内容</th></tr></thead>
+    <tbody id="events"></tbody></table>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+function toast(msg, ok=true){
+  const d = document.createElement('div');
+  d.className = ok ? 'ok' : 'err'; d.textContent = msg;
+  $('#toast').appendChild(d); setTimeout(()=>d.remove(), 6000);
+}
+function fmt(ts){ return ts ? new Date(ts*1000).toLocaleTimeString('zh-CN',{hour12:false}) : '-'; }
+function esc(s){ return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function statusBadge(s){
+  const map = {ACKED:['b-ok','已回执 ACKED'], PENDING:['b-warn','待回执 PENDING'],
+    TIMEOUT_UNCERTAIN:['b-bad','结果不确定 TIMEOUT'], FAILED:['b-bad','失败 FAILED']};
+  const [cls,label] = map[s] || ['b-mut',s];
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+async function api(path, opts={}){
+  const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
+  const data = await r.json().catch(()=>({}));
+  if(!r.ok) throw Object.assign(new Error(data.detail||data.reason||data.error||('HTTP '+r.status)), {data});
+  return data;
+}
+
+async function switchTo(target){
+  try{
+    const r = await api('/api/switch', {method:'POST', body:JSON.stringify({target})});
+    toast(r.noop ? `目标 ${target} 已是现役节点` : `切流成功：${r.previous} → ${r.active}`);
+    await refresh();
+  }catch(e){ toast('切流被拦截，保持旧路由：'+e.message, false); await refresh(); }
+}
+async function setFault(name, on){
+  await api(`/api/nodes/${name}/fault`, {method:'POST', body:JSON.stringify({on})});
+  toast(`节点 ${name} 健康故障注入：${on?'开启':'解除'}`); await refresh();
+}
+async function loadRecords(name){
+  try{ $('#rec'+name).textContent = '加载中…';
+    const r = await api(`/api/nodes/${name}/records`);
+    $('#rec'+name).textContent = JSON.stringify(r, null, 2);
+  }catch(e){ $('#rec'+name).textContent = '加载失败：'+e.message; }
+}
+async function refreshOne(id){
+  try{ const r = await api(`/api/writes/${encodeURIComponent(id)}/refresh`);
+    toast(r.note ? r.note : `已向原节点 ${r.write.target_node} 查询：${r.write.status}`);
+    await refresh();
+  }catch(e){ toast('查询失败：'+e.message, false); }
+}
+
+$('#send').onclick = async () => {
+  const btn = $('#send'); btn.disabled = true; btn.textContent = '投递中…';
+  const payload = $('#payload').value.trim() || ('auto-'+Date.now());
+  const delay = parseFloat($('#delay').value) || 0;
+  const t0 = Date.now();
+  try{
+    const r = await api(`/api/writes?delay=${delay}`,
+      {method:'POST', body: JSON.stringify({payload})});
+    toast(`写入 ${r.id} 已由节点 ${r.node} 回执（耗时 ${((Date.now()-t0)/1000).toFixed(1)}s）`);
+  }catch(e){
+    const d = e.data || {};
+    if(d.uncertain) toast(`⚠️ 回执超时，结果不确定（${((Date.now()-t0)/1000).toFixed(1)}s），未补投`, false);
+    else toast('写入失败：'+e.message, false);
+  }finally{ btn.disabled=false; btn.textContent='投递写入'; await refresh(); }
+};
+
+async function refresh(){
+  let s;
+  try{ s = await api('/api/status'); }catch(e){ return; }
+  $('#clock').textContent = new Date(s.ts*1000).toLocaleString('zh-CN',{hour12:false});
+  $('#active').textContent = s.active;
+  $('#nodes').innerHTML = Object.entries(s.nodes).map(([name, h]) => {
+    const d = s.drainage[name] || {};
+    const isActive = name === s.active;
+    return `<div class="card node" style="padding:14px">
+      <div class="row"><b style="font-size:16px">节点 ${esc(name)}</b>
+        <span class="badge ${h.healthy?'b-ok':'b-bad'}">${h.healthy?'健康':'故障/不可达'}</span>
+        ${isActive?'<span class="badge b-info">现役 ACTIVE</span>':'<span class="badge b-mut">备用 STANDBY</span>'}
+        ${d.draining?'<span class="badge b-warn">排空中 DRAINING</span>':''}
+      </div>
+      <div class="muted mono" style="font-size:12px">${esc(h.base_url)}</div>
+      <div class="muted" style="font-size:12px">探测：${esc(h.detail)}</div>
+      <div class="kv">
+        <b>在途(未回执)</b><span>${d.inflight_now??0} 个 ${(d.inflight_ids||[]).length?('<code>'+d.inflight_ids.map(esc).join(', ')+'</code>'):''}</span>
+        <b>写入总数</b><span>${d.total??0}</span>
+        <b>已回执 / 待回执 / 不确定 / 失败</b>
+        <span>${d.acked??0} / ${d.pending??0} / ${d.timeout_uncertain??0} / ${d.failed??0}</span>
+      </div>
+      <div class="row">
+        <button class="primary" ${isActive?'disabled':''} onclick="switchTo('${esc(name)}')">切换流量到 ${esc(name)}</button>
+        <button class="danger" onclick="setFault('${esc(name)}', true)">注入健康故障</button>
+        <button onclick="setFault('${esc(name)}', false)">解除故障</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  $('#writes tbody').innerHTML = s.writes.map(w => `<tr>
+    <td class="mono">${esc(w.id.slice(0,8))}…</td>
+    <td><span class="badge ${w.target_node===s.active?'b-info':'b-mut'}">${esc(w.target_node)}</span></td>
+    <td>${statusBadge(w.status)}</td>
+    <td class="muted" style="max-width:380px">${esc(w.status_detail)}</td>
+    <td class="muted">${fmt(w.created_at)}</td>
+    <td><button onclick="refreshOne('${esc(w.id)}')">向原节点查询</button></td>
+  </tr>`).join('') || '<tr><td colspan="6" class="muted">暂无写入</td></tr>';
+
+  $('#events').innerHTML = s.events.map(ev => `<tr>
+    <td class="muted">${fmt(ev.ts)}</td><td><span class="badge b-mut">${esc(ev.kind)}</span></td>
+    <td style="max-width:680px">${esc(ev.message)}</td></tr>`).join('');
+}
+let timer;
+function arm(){ clearInterval(timer); if($('#autopoll').checked) timer = setInterval(refresh, 2000); }
+$('#autopoll').onchange = arm;
+arm(); refresh();
+</script>
+</body>
+</html>
